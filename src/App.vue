@@ -222,6 +222,31 @@ const requestDelete = (id: string, event: Event) => {
   }, 2200)
 }
 
+const escapeHtml = (value: string) =>
+  value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+
+const formatMessageContent = (value: string) => {
+  const segments = value.split(/```([\s\S]*?)```/g)
+
+  return segments
+    .map((segment, index) => {
+      if (index % 2 === 1) {
+        return `<pre class="formatted-code"><code>${escapeHtml(segment.trim())}</code></pre>`
+      }
+
+      const safeText = escapeHtml(segment)
+      return safeText
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n/g, '<br>')
+    })
+    .join('')
+}
+
 const scrollToBottom = async () => {
   await nextTick()
   requestAnimationFrame(() => {
@@ -410,7 +435,12 @@ onMounted(async () => {
               </div>
             </template>
 
-            <div v-else class="bubble" :class="{ error: message.isError }">{{ message.content }}</div>
+            <div
+              v-else
+              class="bubble"
+              :class="{ error: message.isError }"
+              v-html="formatMessageContent(message.content)"
+            />
 
             <div v-if="message.role === 'user'" class="user-badge">U</div>
           </div>
@@ -830,8 +860,32 @@ textarea {
   border: 1px solid var(--border);
   color: var(--text);
   line-height: 1.6;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.bubble strong {
+  font-weight: 800;
+}
+
+.bubble .formatted-code {
+  margin: 10px 0 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #0b1120;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
+  color: #dbeafe;
+  user-select: text;
+}
+
+.bubble .formatted-code code {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
 }
 
 .message-row.user .bubble {
