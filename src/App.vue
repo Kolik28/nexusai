@@ -177,6 +177,13 @@ const buildReply = (prompt: string) => {
   if (!text) return 'Saya belum menerima pertanyaan apa pun.'
   if (text.includes('halo') || text.includes('hai') || text.includes('hello')) return 'Halo! Saya NexusAI. Ada yang bisa saya bantu hari ini?'
   if (text.includes('siapa') && text.includes('kamu')) return 'Saya adalah NexusAI, asisten yang bisa bantu menulis, menjelaskan ide, dan membuat draft.'
+  if (
+    (text.includes('siapa') || text.includes('nama')) &&
+    (text.includes('pembuat') || text.includes('creator') || text.includes('developer') || text.includes('buat') || text.includes('membuat')) &&
+    (text.includes('kamu') || text.includes('nexus') || text.includes('ai'))
+  ) {
+    return 'Pembuat saya adalah Adun.'
+  }
   if (text.includes('buat') || text.includes('tulis') || text.includes('konten')) return 'Saya bisa bantu menulis ide, ringkasan, draft pesan, atau konten singkat. Coba kirim topik yang ingin Anda kembangkan.'
   if (text.includes('aplikasi') || text.includes('website') || text.includes('project')) return 'Untuk aplikasi atau website, biasanya langkah terbaik adalah mulai dari kebutuhan pengguna, lalu struktur fitur, UI, dan alur kerja yang sederhana.'
   return `Saya menerima pesan Anda: “${prompt}”. Saya siap bantu menjelaskan ide, membuat ringkasan, atau menyusun jawaban yang lebih rapi.`
@@ -699,32 +706,43 @@ textarea {
   min-width: 0;
   min-height: 0;
   height: 100%;
+  overflow: hidden;
 }
 
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 16px 22px;
   border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  backdrop-filter: blur(10px);
 }
 
 .topbar-left {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
 }
 
 .page-title {
   font-family: 'Sora', sans-serif;
   font-size: 15px;
   font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .page-subtitle {
   font-size: 11.5px;
   color: var(--text-faint);
   margin-top: 2px;
+  white-space: nowrap;
 }
 
 .nav-button,
@@ -1088,6 +1106,18 @@ textarea {
 
   .mobile-only {
     display: flex;
+  }
+
+  .topbar {
+    padding: 12px 14px;
+  }
+
+  .page-title {
+    max-width: 160px;
+  }
+
+  .page-subtitle {
+    display: none;
   }
 
   .message-list {
