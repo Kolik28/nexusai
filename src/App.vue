@@ -872,14 +872,15 @@ textarea {
 
 .bubble {
   max-width: min(82%, 620px);
-  padding: 12px 14px;
-  border-radius: var(--radius);
+  padding: 12px 18px;
+  border-radius: 22px;
   background: var(--surface-2);
   border: 1px solid var(--border);
   color: var(--text);
   line-height: 1.6;
   white-space: normal;
   word-break: break-word;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
 }
 
 .bubble strong {
@@ -910,6 +911,7 @@ textarea {
   background: linear-gradient(135deg, var(--accent), #8b5cf6);
   color: #fff;
   border-color: transparent;
+  border-radius: 22px;
 }
 
 .bubble.error {
@@ -922,7 +924,7 @@ textarea {
   width: min(760px, 100%);
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 18px;
+  border-radius: 22px;
   padding: 12px;
   box-shadow: var(--shadow);
 }
@@ -985,7 +987,8 @@ textarea {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 10px 14px;
+  padding: 10px 18px;
+  border-radius: 22px;
 }
 
 .typing span {
