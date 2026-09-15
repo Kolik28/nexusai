@@ -1,7 +1,16 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 type Role = 'user' | 'assistant'
+
+type Attachment = {
+  name: string
+  size: number
+  type: string
+  kind: 'image' | 'file'
+  url?: string
+  dataUrl?: string
+}
 
 type Message = {
   role: Role
@@ -10,6 +19,7 @@ type Message = {
   isCode?: boolean
   code?: string
   preview?: string
+  attachments?: Attachment[]
 }
 
 type Conversation = {
@@ -18,12 +28,15 @@ type Conversation = {
   messages: Message[]
 }
 
+type Theme = 'dark' | 'light'
+
 const ICONS = {
   sun: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.9 19.1l1.7-1.7M17.4 6.6l1.7-1.7"/></svg>`,
   moon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.8 6.8 0 0 0 10.5 10.5Z"/></svg>`,
   plus: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>`,
   trash: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m2 0-.8 12.1a2 2 0 0 1-2 1.9H9.8a2 2 0 0 1-2-1.9L7 7"/></svg>`,
   send: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h15M13 6l6 6-6 6"/></svg>`,
+  menu: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>`,
 } as const
 
 const NODE_MARK = `
@@ -40,6 +53,12 @@ const NODE_MARK = `
     <circle cx="26" cy="22" r="2.4" fill="currentColor" opacity="0.75"/>
   </svg>`
 
+const STORAGE_KEYS = {
+  conversations: 'nexusai.conversations.v1',
+  activeId: 'nexusai.activeId.v1',
+  theme: 'nexusai.theme.v1',
+} as const
+
 const uid = () => Math.random().toString(36).slice(2, 10)
 
 const makeConversation = (title = 'Percakapan baru'): Conversation => ({
@@ -48,15 +67,65 @@ const makeConversation = (title = 'Percakapan baru'): Conversation => ({
   messages: [],
 })
 
-const theme = ref<'dark' | 'light'>('dark')
-const conversations = ref<Conversation[]>([makeConversation()])
-const activeId = ref<string>(conversations.value[0]?.id ?? '')
+// --- Safe localStorage helpers (private browsing / disabled storage / SSR won't throw) ---
+const safeStorage = {
+  get(key: string): string | null {
+    try {
+      return typeof window === 'undefined' ? null : window.localStorage.getItem(key)
+    } catch {
+      return null
+    }
+  },
+  set(key: string, value: string) {
+    try {
+      if (typeof window !== 'undefined') window.localStorage.setItem(key, value)
+    } catch {
+      /* storage unavailable — fail silently, app still works in-memory */
+    }
+  },
+}
+
+const loadInitialConversations = (): Conversation[] => {
+  const raw = safeStorage.get(STORAGE_KEYS.conversations)
+  if (!raw) return [makeConversation()]
+  try {
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      // Basic shape validation so corrupted/old data can't crash the app.
+      const valid = parsed.every(
+        (c) => c && typeof c.id === 'string' && typeof c.title === 'string' && Array.isArray(c.messages),
+      )
+      if (valid) return parsed
+    }
+  } catch {
+    /* fall through to default */
+  }
+  return [makeConversation()]
+}
+
+const loadInitialTheme = (): Theme => {
+  const raw = safeStorage.get(STORAGE_KEYS.theme)
+  return raw === 'light' || raw === 'dark' ? raw : 'dark'
+}
+
+const theme = ref<Theme>(loadInitialTheme())
+const conversations = ref<Conversation[]>(loadInitialConversations())
+const initialActiveId = safeStorage.get(STORAGE_KEYS.activeId)
+const activeId = ref<string>(
+  (initialActiveId && conversations.value.some((c) => c.id === initialActiveId)
+    ? initialActiveId
+    : conversations.value[0]?.id) ?? '',
+)
 const input = ref('')
+const uploadedFiles = ref<Attachment[]>([])
 const isSending = ref(false)
 const confirmingDelete = ref<string | null>(null)
 const sidebarOpen = ref(false)
 const messagesEl = ref<HTMLElement | null>(null)
+const textareaEl = ref<HTMLTextAreaElement | null>(null)
+const fileInputEl = ref<HTMLInputElement | null>(null)
 const previewCode = ref<string | null>(null)
+let deleteConfirmTimeout: number | null = null
 
 const active = computed<Conversation | null>(
   () => conversations.value.find((conversation) => conversation.id === activeId.value) ?? conversations.value[0] ?? null,
@@ -85,13 +154,25 @@ const extractText = (value: unknown): string | null => {
   return null
 }
 
-const askPuterAi = async (prompt: string) => {
+const readFileAsDataUrl = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(new Error('Failed to read file'))
+    reader.readAsDataURL(file)
+  })
+
+const askPuterAi = async (prompt: string, attachments: Attachment[] = []) => {
   const puterClient = (window as any).puter
   if (!puterClient?.ai?.chat) return null
 
   try {
+    const imageAttachment = attachments.find((attachment) => attachment.kind === 'image' && attachment.dataUrl)
+
     const response = await Promise.race([
-      puterClient.ai.chat(prompt),
+      imageAttachment?.dataUrl
+        ? puterClient.ai.chat(prompt, imageAttachment.dataUrl, { model: 'gpt-5.6-luna' })
+        : puterClient.ai.chat(prompt),
       new Promise((_, reject) => window.setTimeout(() => reject(new Error('Puter AI timeout')), 15000)),
     ])
 
@@ -186,11 +267,15 @@ const buildReply = (prompt: string) => {
   }
   if (text.includes('buat') || text.includes('tulis') || text.includes('konten')) return 'Saya bisa bantu menulis ide, ringkasan, draft pesan, atau konten singkat. Coba kirim topik yang ingin Anda kembangkan.'
   if (text.includes('aplikasi') || text.includes('website') || text.includes('project')) return 'Untuk aplikasi atau website, biasanya langkah terbaik adalah mulai dari kebutuhan pengguna, lalu struktur fitur, UI, dan alur kerja yang sederhana.'
-  return `Saya menerima pesan Anda: “${prompt}”. Saya siap bantu menjelaskan ide, membuat ringkasan, atau menyusun jawaban yang lebih rapi.`
+  return `Saya menerima pesan Anda: "${prompt}". Saya siap bantu menjelaskan ide, membuat ringkasan, atau menyusun jawaban yang lebih rapi.`
 }
 
 const toggleTheme = () => {
   theme.value = theme.value === 'dark' ? 'light' : 'dark'
+}
+
+const resetTextareaHeight = () => {
+  if (textareaEl.value) textareaEl.value.style.height = 'auto'
 }
 
 const newChat = () => {
@@ -199,6 +284,7 @@ const newChat = () => {
   activeId.value = conversation.id
   input.value = ''
   sidebarOpen.value = false
+  resetTextareaHeight()
 }
 
 const selectChat = (id: string) => {
@@ -207,9 +293,18 @@ const selectChat = (id: string) => {
   confirmingDelete.value = null
 }
 
+const clearDeleteTimeout = () => {
+  if (deleteConfirmTimeout !== null) {
+    window.clearTimeout(deleteConfirmTimeout)
+    deleteConfirmTimeout = null
+  }
+}
+
 const requestDelete = (id: string, event: Event) => {
   event.stopPropagation()
+
   if (confirmingDelete.value === id) {
+    clearDeleteTimeout()
     const index = conversations.value.findIndex((conversation) => conversation.id === id)
     if (index !== -1) conversations.value.splice(index, 1)
     if (conversations.value.length === 0) {
@@ -223,9 +318,11 @@ const requestDelete = (id: string, event: Event) => {
     return
   }
 
+  clearDeleteTimeout()
   confirmingDelete.value = id
-  window.setTimeout(() => {
+  deleteConfirmTimeout = window.setTimeout(() => {
     if (confirmingDelete.value === id) confirmingDelete.value = null
+    deleteConfirmTimeout = null
   }, 2200)
 }
 
@@ -254,6 +351,52 @@ const formatMessageContent = (value: string) => {
     .join('')
 }
 
+const formatFileSize = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+const createAttachmentFromFile = async (file: File): Promise<Attachment> => {
+  const imageKind = file.type.startsWith('image/')
+  const dataUrl = imageKind ? await readFileAsDataUrl(file) : undefined
+
+  return {
+    name: file.name,
+    size: file.size,
+    type: file.type,
+    kind: imageKind ? 'image' : 'file',
+    ...(imageKind ? { url: URL.createObjectURL(file), dataUrl } : {}),
+  }
+}
+
+const triggerFilePicker = () => {
+  fileInputEl.value?.click()
+}
+
+const clearUploadedFiles = () => {
+  uploadedFiles.value.forEach((file) => {
+    if (file.url) URL.revokeObjectURL(file.url)
+  })
+  uploadedFiles.value = []
+}
+
+const handleFileSelection = async (event: Event) => {
+  const target = event.target as HTMLInputElement | null
+  const files = Array.from(target?.files ?? [])
+
+  if (!files.length || !target) return
+
+  const attachments = await Promise.all(files.map((file) => createAttachmentFromFile(file)))
+  uploadedFiles.value = [...uploadedFiles.value, ...attachments]
+  target.value = ''
+}
+
+const removeAttachment = (index: number) => {
+  const [removed] = uploadedFiles.value.splice(index, 1)
+  if (removed?.url) URL.revokeObjectURL(removed.url)
+}
+
 const scrollToBottom = async () => {
   await nextTick()
   requestAnimationFrame(() => {
@@ -267,43 +410,67 @@ const copyCode = async (code: string) => {
   try {
     await navigator.clipboard.writeText(code)
   } catch {
-    const textarea = document.createElement('textarea')
-    textarea.value = code
-    document.body.appendChild(textarea)
-    textarea.select()
-    document.execCommand('copy')
-    textarea.remove()
+    try {
+      const textarea = document.createElement('textarea')
+      textarea.value = code
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      textarea.remove()
+    } catch {
+      /* clipboard unavailable — nothing more we can safely do */
+    }
   }
 }
 
 const sendMessage = async () => {
   const text = input.value.trim()
-  if (!text || isSending.value) return
+  const hasAttachments = uploadedFiles.value.length > 0
+
+  if ((!text && !hasAttachments) || isSending.value) return
 
   const conversation = active.value
   if (!conversation) return
 
+  const attachmentNames = uploadedFiles.value.map((file) => file.name)
+  const finalPrompt = text || `Mengirim ${attachmentNames.length} file: ${attachmentNames.join(', ')}`
+
   if (conversation.messages.length === 0) {
-    conversation.title = text.length > 36 ? `${text.slice(0, 33)}...` : text
+    const titleSource = text || attachmentNames[0] || 'Percakapan baru'
+    conversation.title = titleSource.length > 36 ? `${titleSource.slice(0, 33)}...` : titleSource
   }
 
-  conversation.messages.push({ role: 'user', content: text })
+  const sentAttachments = uploadedFiles.value.slice()
+  const singleAttachmentName = sentAttachments[0]?.name ?? 'file'
+  conversation.messages.push({
+    role: 'user',
+    content: text || (sentAttachments.length === 1 ? `Mengirim file: ${singleAttachmentName}` : `Mengirim ${sentAttachments.length} file`),
+    attachments: sentAttachments.length ? sentAttachments : undefined,
+  })
+
+  uploadedFiles.value = []
   input.value = ''
+  resetTextareaHeight()
   isSending.value = true
   await scrollToBottom()
 
   try {
     await new Promise((resolve) => window.setTimeout(resolve, 450))
 
-    const puterReply = await askPuterAi(text)
-    const generatedCode = generateCodeSnippet(text)
+    const puterReply = await askPuterAi(finalPrompt, sentAttachments)
+    const generatedCode = generateCodeSnippet(finalPrompt)
 
     if (puterReply) {
       conversation.messages.push({ role: 'assistant', content: String(puterReply) })
     } else if (generatedCode) {
       conversation.messages.push(generatedCode)
     } else {
-      conversation.messages.push({ role: 'assistant', content: buildReply(text) })
+      const fallbackText = hasAttachments
+        ? `Saya menerima file berikut: ${attachmentNames.join(', ')}. Jika Anda mau, saya bisa meninjau isinya, meringkasnya, atau membantu mengubahnya menjadi format lain.`
+        : buildReply(finalPrompt)
+      conversation.messages.push({ role: 'assistant', content: fallbackText })
     }
   } catch {
     conversation.messages.push({
@@ -314,6 +481,7 @@ const sendMessage = async () => {
   } finally {
     isSending.value = false
     await scrollToBottom()
+    textareaEl.value?.focus()
   }
 }
 
@@ -324,6 +492,20 @@ const onKeydown = (event: KeyboardEvent) => {
   }
 }
 
+const handlePaste = async (event: ClipboardEvent) => {
+  const items = Array.from(event.clipboardData?.items ?? [])
+  const imageFiles = items
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file))
+
+  if (!imageFiles.length) return
+
+  event.preventDefault()
+  const attachments = await Promise.all(imageFiles.map((file) => createAttachmentFromFile(file)))
+  uploadedFiles.value = [...uploadedFiles.value, ...attachments]
+}
+
 const handleTextareaInput = (event: Event) => {
   const target = event.target as HTMLTextAreaElement | null
   if (!target) return
@@ -331,11 +513,32 @@ const handleTextareaInput = (event: Event) => {
   target.style.height = `${target.scrollHeight}px`
 }
 
+const onGlobalKeydown = (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && sidebarOpen.value) {
+    sidebarOpen.value = false
+  }
+}
+
 watch(
   theme,
-  (value) => document.documentElement.setAttribute('data-theme', value),
+  (value) => {
+    document.documentElement.setAttribute('data-theme', value)
+    safeStorage.set(STORAGE_KEYS.theme, value)
+  },
   { immediate: true },
 )
+
+watch(
+  conversations,
+  (value) => {
+    safeStorage.set(STORAGE_KEYS.conversations, JSON.stringify(value))
+  },
+  { deep: true },
+)
+
+watch(activeId, (value) => {
+  safeStorage.set(STORAGE_KEYS.activeId, value)
+})
 
 watch(
   () => active.value?.messages.length,
@@ -347,7 +550,14 @@ watch(
 
 onMounted(async () => {
   document.documentElement.setAttribute('data-theme', theme.value)
+  window.addEventListener('keydown', onGlobalKeydown)
   await scrollToBottom()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
+  clearDeleteTimeout()
+  clearUploadedFiles()
 })
 </script>
 
@@ -355,7 +565,7 @@ onMounted(async () => {
   <div class="shell">
     <div v-if="sidebarOpen" class="overlay" @click="sidebarOpen = false" />
 
-    <aside class="sidebar" :class="{ open: sidebarOpen }">
+    <aside class="sidebar" :class="{ open: sidebarOpen }" aria-label="Daftar percakapan">
       <div class="brand">
         <div class="brand-mark" v-html="NODE_MARK" />
         <div class="brand-name">Nexus<span>AI</span></div>
@@ -366,12 +576,14 @@ onMounted(async () => {
         <span>Percakapan baru</span>
       </button>
 
-      <div class="conversation-list">
+      <div class="conversation-list" role="list">
         <button
           v-for="conversation in conversations"
           :key="conversation.id"
           class="conversation-item"
           :class="{ active: conversation.id === activeId }"
+          role="listitem"
+          :aria-current="conversation.id === activeId ? 'true' : undefined"
           @click="selectChat(conversation.id)"
         >
           <span class="dot" />
@@ -379,7 +591,12 @@ onMounted(async () => {
           <span
             class="delete-btn"
             :class="{ confirming: confirmingDelete === conversation.id }"
+            role="button"
+            tabindex="0"
+            :aria-label="confirmingDelete === conversation.id ? 'Konfirmasi hapus percakapan' : 'Hapus percakapan'"
             @click.stop="requestDelete(conversation.id, $event)"
+            @keydown.enter.stop="requestDelete(conversation.id, $event)"
+            @keydown.space.stop.prevent="requestDelete(conversation.id, $event)"
             :title="confirmingDelete === conversation.id ? 'Hapus sekarang' : 'Hapus percakapan'"
           >
             <span v-if="confirmingDelete === conversation.id">Yakin?</span>
@@ -394,21 +611,26 @@ onMounted(async () => {
     <main class="main-panel">
       <header class="topbar">
         <div class="topbar-left">
-          <button class="nav-button mobile-only" @click="sidebarOpen = !sidebarOpen" aria-label="Buka sidebar">
-            <span class="icon-wrap" v-html="ICONS.plus" />
+          <button class="nav-button mobile-only" @click="sidebarOpen = !sidebarOpen" aria-label="Buka daftar percakapan">
+            <span class="icon-wrap" v-html="ICONS.menu" />
           </button>
-          <div>
+          <div class="topbar-titles">
             <div class="page-title">{{ active?.title ?? 'NexusAI' }}</div>
             <div class="page-subtitle">NexusAI • siap membantu</div>
           </div>
         </div>
 
-        <button class="theme-toggle" @click="toggleTheme" :title="theme === 'dark' ? 'Mode terang' : 'Mode gelap'">
+        <button
+          class="theme-toggle"
+          @click="toggleTheme"
+          :aria-label="theme === 'dark' ? 'Aktifkan mode terang' : 'Aktifkan mode gelap'"
+          :title="theme === 'dark' ? 'Mode terang' : 'Mode gelap'"
+        >
           <span class="icon-wrap" v-html="theme === 'dark' ? ICONS.sun : ICONS.moon" />
         </button>
       </header>
 
-      <section class="messages" ref="messagesEl">
+      <section class="messages" ref="messagesEl" role="log" aria-live="polite" aria-label="Riwayat percakapan">
         <div v-if="!active || active.messages.length === 0" class="empty-state">
           <div class="empty-mark" v-html="NODE_MARK" />
           <div class="empty-title">Mulai percakapan dengan NexusAI</div>
@@ -422,7 +644,7 @@ onMounted(async () => {
             class="message-row"
             :class="message.role"
           >
-            <div v-if="message.role === 'assistant'" class="avatar" v-html="NODE_MARK" />
+            <div v-if="message.role === 'assistant'" class="avatar" aria-hidden="true" v-html="NODE_MARK" />
 
             <template v-if="message.isCode">
               <div class="code-card">
@@ -437,7 +659,14 @@ onMounted(async () => {
                 </div>
                 <pre class="code-block">{{ message.code }}</pre>
                 <div v-if="previewCode === message.preview" class="preview-panel">
-                  <iframe :srcdoc="message.preview ?? ''" title="Preview code" class="preview-frame" />
+                  <iframe
+                    :srcdoc="message.preview ?? ''"
+                    title="Preview kode"
+                    class="preview-frame"
+                    sandbox="allow-scripts allow-modals"
+                    referrerpolicy="no-referrer"
+                    loading="lazy"
+                  />
                 </div>
               </div>
             </template>
@@ -449,10 +678,25 @@ onMounted(async () => {
               v-html="formatMessageContent(message.content)"
             />
 
-            <div v-if="message.role === 'user'" class="user-badge">U</div>
+            <div v-if="message.role === 'user' && message.attachments?.length" class="attachment-list">
+              <div v-for="(attachment, attachmentIndex) in message.attachments" :key="`${attachment.name}-${attachmentIndex}`" class="attachment-item">
+                <img
+                  v-if="attachment.kind === 'image' && attachment.url"
+                  :src="attachment.url"
+                  class="attachment-image"
+                  :alt="attachment.name"
+                />
+                <div class="attachment-meta" :class="{ file: attachment.kind !== 'image' }">
+                  <span class="attachment-name">{{ attachment.name }}</span>
+                  <span class="attachment-size">{{ formatFileSize(attachment.size) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="message.role === 'user'" class="user-badge" aria-hidden="true">U</div>
           </div>
 
-          <div v-if="isSending" class="message-row assistant">
+          <div v-if="isSending" class="message-row assistant" aria-hidden="true">
             <div class="avatar" v-html="NODE_MARK" />
             <div class="bubble typing"><span /><span /><span /></div>
           </div>
@@ -460,19 +704,36 @@ onMounted(async () => {
       </section>
 
       <footer class="composer-wrap">
+        <div v-if="uploadedFiles.length" class="upload-preview">
+          <div v-for="(file, index) in uploadedFiles" :key="`${file.name}-${index}`" class="upload-chip">
+            <span class="upload-name">{{ file.name }}</span>
+            <button type="button" class="upload-remove" @click="removeAttachment(index)" aria-label="Hapus file">×</button>
+          </div>
+        </div>
+
         <div class="composer">
+          <button type="button" class="upload-btn" @click="triggerFilePicker" aria-label="Upload file">
+            <span class="icon-wrap">📎</span>
+          </button>
+          <input ref="fileInputEl" type="file" class="sr-only" multiple @change="handleFileSelection" />
+
+          <label for="composer-input" class="sr-only">Tulis pesan</label>
           <textarea
+            id="composer-input"
+            ref="textareaEl"
             rows="1"
             v-model="input"
             placeholder="Kirim pesan ke NexusAI..."
+            :disabled="isSending"
             @keydown="onKeydown"
+            @paste="handlePaste"
             @input="handleTextareaInput"
           />
-          <button class="send-btn" :disabled="!input.trim() || isSending" @click="sendMessage" aria-label="Kirim pesan">
+          <button class="send-btn" :disabled="(!input.trim() && !uploadedFiles.length) || isSending" @click="sendMessage" aria-label="Kirim pesan">
             <span class="icon-wrap" v-html="ICONS.send" />
           </button>
         </div>
-        <div class="composer-hint">Enter untuk kirim • Shift + Enter untuk baris baru</div>
+        <div class="composer-hint">Enter untuk kirim • Shift + Enter untuk baris baru • lampiran file didukung</div>
       </footer>
     </main>
   </div>
@@ -547,10 +808,33 @@ textarea {
   font: inherit;
 }
 
+button {
+  touch-action: manipulation;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+:deep(:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 .shell {
   display: grid;
   grid-template-columns: 280px 1fr;
   height: 100%;
+  height: 100dvh;
   background: var(--bg);
 }
 
@@ -560,6 +844,7 @@ textarea {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 .brand {
@@ -574,6 +859,7 @@ textarea {
   height: 30px;
   display: block;
   color: var(--accent);
+  flex-shrink: 0;
 }
 
 .brand-mark svg {
@@ -606,6 +892,7 @@ textarea {
   color: var(--text);
   font-weight: 600;
   cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .new-chat-btn:hover {
@@ -620,6 +907,7 @@ textarea {
   flex-direction: column;
   gap: 4px;
   overflow-y: auto;
+  min-height: 0;
 }
 
 .conversation-item {
@@ -633,6 +921,7 @@ textarea {
   padding: 10px 10px;
   cursor: pointer;
   text-align: left;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 .conversation-item:hover {
@@ -679,6 +968,7 @@ textarea {
   background: transparent;
   font-size: 10px;
   font-weight: 700;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 .delete-btn:hover {
@@ -698,6 +988,7 @@ textarea {
   padding: 12px 18px 16px;
   color: var(--text-faint);
   font-size: 11px;
+  flex-shrink: 0;
 }
 
 .main-panel {
@@ -720,12 +1011,17 @@ textarea {
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface) 90%, transparent);
   backdrop-filter: blur(10px);
+  flex-shrink: 0;
 }
 
 .topbar-left {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
+}
+
+.topbar-titles {
   min-width: 0;
 }
 
@@ -757,6 +1053,8 @@ textarea {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease;
 }
 
 .nav-button:hover,
@@ -771,6 +1069,7 @@ textarea {
   align-items: center;
   justify-content: center;
   color: currentColor;
+  pointer-events: none;
 }
 
 .icon-wrap svg {
@@ -785,6 +1084,8 @@ textarea {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 26px 0;
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
 }
 
 .empty-state {
@@ -834,10 +1135,17 @@ textarea {
   align-items: flex-start;
   gap: 10px;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.message-row > * {
+  min-width: 0;
 }
 
 .message-row.user {
   justify-content: flex-end;
+  min-width: 0;
 }
 
 .avatar,
@@ -871,7 +1179,10 @@ textarea {
 }
 
 .bubble {
+  display: block;
+  width: auto;
   max-width: min(82%, 620px);
+  min-width: 0;
   padding: 12px 18px;
   border-radius: 22px;
   background: var(--surface-2);
@@ -879,7 +1190,9 @@ textarea {
   color: var(--text);
   line-height: 1.6;
   white-space: normal;
+  overflow-wrap: anywhere;
   word-break: break-word;
+  box-sizing: border-box;
   box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
 }
 
@@ -895,6 +1208,7 @@ textarea {
   border: 1px solid rgba(148, 163, 184, 0.25);
   overflow-x: auto;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
   color: #dbeafe;
   user-select: text;
@@ -920,12 +1234,67 @@ textarea {
   color: var(--danger);
 }
 
+.attachment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  width: min(100%, 420px);
+}
+
+.attachment-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(148, 163, 184, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 8px 10px;
+}
+
+.attachment-image {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--surface-3);
+}
+
+.attachment-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 3px;
+}
+
+.attachment-meta.file {
+  padding-left: 2px;
+}
+
+.attachment-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-size {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
 .code-card {
-  width: min(760px, 100%);
+  width: min(100%, 760px);
+  max-width: 100%;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 22px;
   padding: 12px;
+  box-sizing: border-box;
   box-shadow: var(--shadow);
 }
 
@@ -952,6 +1321,10 @@ textarea {
   border-radius: 10px;
   padding: 7px 10px;
   cursor: pointer;
+}
+
+.mini-btn:hover {
+  border-color: var(--accent);
 }
 
 .code-block {
@@ -1009,7 +1382,8 @@ textarea {
 
 .composer-wrap {
   border-top: 1px solid var(--border);
-  padding: 16px 22px 24px;
+  padding: 16px 22px calc(env(safe-area-inset-bottom, 0px) + 24px);
+  flex-shrink: 0;
 }
 
 .composer {
@@ -1018,15 +1392,71 @@ textarea {
   display: flex;
   align-items: flex-end;
   gap: 12px;
-  padding: 8px 8px 8px 16px;
+  padding: 8px 8px 8px 12px;
   border: 1px solid var(--border);
   border-radius: 18px;
   background: var(--surface-2);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .composer:focus-within {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(132, 103, 255, 0.12);
+}
+
+.upload-btn {
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-3);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.upload-btn:hover {
+  border-color: var(--accent);
+}
+
+.upload-preview {
+  max-width: 760px;
+  margin: 0 auto 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.upload-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+}
+
+.upload-name {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.upload-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0;
 }
 
 .composer textarea {
@@ -1041,6 +1471,11 @@ textarea {
   max-height: 180px;
   min-height: 44px;
   padding: 8px 0;
+}
+
+.composer textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .composer textarea::placeholder {
@@ -1059,6 +1494,7 @@ textarea {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  transition: filter 0.15s ease;
 }
 
 .send-btn:disabled {
@@ -1129,6 +1565,29 @@ textarea {
 
   .bubble {
     max-width: 88%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .new-chat-btn,
+  .conversation-item,
+  .delete-btn,
+  .nav-button,
+  .theme-toggle,
+  .mini-btn,
+  .send-btn,
+  .composer {
+    transition: none !important;
+  }
+
+  .typing span {
+    animation: none !important;
+    opacity: 0.8;
+  }
+
+  .messages {
+    scroll-behavior: auto;
   }
 }
 </style>
