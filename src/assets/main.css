@@ -1,0 +1,24 @@
+@import './base.css';
+
+html,
+body,
+#app {
+  margin: 0;
+  width: 100%;
+  min-height: 100vh;
+  background: #0b0d12;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+body {
+  overflow: hidden;
+}
