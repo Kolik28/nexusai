@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist'
+
+GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
 
 type Role = 'user' | 'assistant'
 
@@ -10,6 +13,7 @@ type Attachment = {
   kind: 'image' | 'file'
   url?: string
   dataUrl?: string
+  extractedText?: string
 }
 
 type Message = {
@@ -140,6 +144,9 @@ const extractText = (value: unknown): string | null => {
     return joined || null
   }
   if (value && typeof value === 'object') {
+    if ('text' in value && typeof (value as { text?: unknown }).text === 'string') {
+      return (value as { text: string }).text
+    }
     if ('content' in value) {
       const content = (value as { content?: unknown }).content
       const text = extractText(content)
@@ -162,94 +169,89 @@ const readFileAsDataUrl = (file: File): Promise<string> =>
     reader.readAsDataURL(file)
   })
 
-const askPuterAi = async (prompt: string, attachments: Attachment[] = []) => {
+const readPdfText = async (file: File) => {
+  const buffer = await file.arrayBuffer()
+  const pdf = await getDocument({ data: new Uint8Array(buffer) }).promise
+  const pages: string[] = []
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber)
+    const content = await page.getTextContent()
+    const text = content.items
+      .map((item) => ('str' in item ? item.str : ''))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+
+    if (text) pages.push(`[Halaman ${pageNumber}]\n${text}`)
+  }
+
+  return pages.join('\n\n')
+}
+
+const isReadableTextFile = (file: File) => {
+  const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
+  return file.type.startsWith('text/') || ['csv', 'json', 'md', 'js', 'ts', 'vue', 'html', 'css', 'xml', 'log'].includes(extension)
+}
+
+const readAttachmentText = async (file: File) => {
+  if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+    return readPdfText(file)
+  }
+
+  if (isReadableTextFile(file)) return file.text()
+  return undefined
+}
+
+const askPuterAi = async (prompt: string, attachments: Attachment[] = [], history: Message[] = []) => {
   const puterClient = (window as any).puter
-  if (!puterClient?.ai?.chat) return null
+  if (!puterClient?.ai?.chat) throw new Error('Puter AI belum tersedia')
 
   try {
+    const responseRules = '\n\nInstruksi: jawab langsung sesuai pertanyaan pengguna dalam bahasa Indonesia. Jangan mengarang, jangan mengulang pertanyaan, dan jangan membahas hal yang tidak diminta. Jika diminta kode, kirim kode lengkap dalam satu blok markdown tanpa penjelasan panjang. Jika menganalisis file, gunakan hanya isi file yang tersedia dan sebutkan jika informasinya tidak cukup.'
     const imageAttachment = attachments.find((attachment) => attachment.kind === 'image' && attachment.dataUrl)
+    const documentText = attachments
+      .filter((attachment) => attachment.extractedText)
+      .map((attachment) => `\n\n--- Isi file: ${attachment.name} ---\n${attachment.extractedText}`)
+      .join('')
+    const conversationContext = history
+      .slice(-12)
+      .map((message) => `${message.role === 'user' ? 'Pengguna' : 'NexusAI'}: ${message.content}`)
+      .join('\n')
+    const contextText = conversationContext
+      ? `\n\nRiwayat percakapan sebelumnya:\n${conversationContext.slice(-20000)}\n\nPertanyaan terbaru pengguna:\n${prompt}`
+      : prompt
+    const promptWithFiles = documentText
+      ? `${contextText}${responseRules}\n\nGunakan isi file berikut untuk menjawab. Jika isi file tidak cukup, katakan dengan jujur.\n${documentText.slice(0, 50000)}`
+      : `${contextText}${responseRules}`
 
-    const response = await Promise.race([
-      imageAttachment?.dataUrl
-        ? puterClient.ai.chat(prompt, imageAttachment.dataUrl, { model: 'gpt-5.6-luna' })
-        : puterClient.ai.chat(prompt),
+    const withTimeout = (request: Promise<unknown>) => Promise.race([
+      request,
       new Promise((_, reject) => window.setTimeout(() => reject(new Error('Puter AI timeout')), 15000)),
     ])
 
+    let response: unknown
+    try {
+      response = await withTimeout(
+        imageAttachment?.dataUrl
+          ? puterClient.ai.chat(promptWithFiles, imageAttachment.dataUrl, { model: 'gpt-5.6-luna', temperature: 0.3 })
+          : puterClient.ai.chat(promptWithFiles, { model: 'gpt-5.6-luna', temperature: 0.3 }),
+      )
+    } catch (configuredError) {
+      console.warn('Puter AI options rejected, retrying with default chat:', configuredError)
+      response = await withTimeout(
+        imageAttachment?.dataUrl
+          ? puterClient.ai.chat(promptWithFiles, imageAttachment.dataUrl)
+          : puterClient.ai.chat(promptWithFiles),
+      )
+    }
+
     const text = extractText(response)
-    return text ?? null
+    if (!text) throw new Error('Puter AI mengembalikan respons kosong')
+    return text
   } catch (error) {
     console.error('Puter AI error:', error)
-    return null
-  }
-}
-
-const generateCodeSnippet = (prompt: string): Message | null => {
-  const text = prompt.trim().toLowerCase()
-  const wantsCode = /kode|html|css|javascript|js|component|button|card/i.test(text)
-  if (!wantsCode) return null
-
-  const label = /button/i.test(text) ? 'button' : /card/i.test(text) ? 'card' : 'landing page'
-  const code = `<!DOCTYPE html>
-<html lang="id">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>${label}</title>
-    <style>
-      * { box-sizing: border-box; }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-        background: linear-gradient(135deg, #0f172a, #1e293b);
-        font-family: Arial, sans-serif;
-        color: white;
-      }
-      .card {
-        width: min(420px, 90vw);
-        padding: 28px;
-        border-radius: 18px;
-        background: rgba(15, 23, 42, 0.8);
-        border: 1px solid rgba(148, 163, 184, 0.3);
-        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.5);
-      }
-      h1 {
-        margin: 0 0 12px;
-        font-size: 2rem;
-      }
-      p {
-        margin: 0 0 18px;
-        color: #cbd5e1;
-        line-height: 1.6;
-      }
-      button {
-        border: none;
-        border-radius: 999px;
-        padding: 12px 20px;
-        background: linear-gradient(135deg, #8b5cf6, #22d3ee);
-        color: white;
-        font-weight: 700;
-        cursor: pointer;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="card">
-      <h1>${label.toUpperCase()}</h1>
-      <p>Ini contoh kode yang bisa langsung Anda copy dan sesuaikan.</p>
-      <button>Mulai sekarang</button>
-    </div>
-  </body>
-</html>`
-
-  return {
-    role: 'assistant',
-    content: 'Berikut contoh kode yang bisa langsung Anda copy.',
-    isCode: true,
-    code,
-    preview: code,
+    throw error
   }
 }
 
@@ -351,6 +353,25 @@ const formatMessageContent = (value: string) => {
     .join('')
 }
 
+const isCodeRequest = (prompt: string) =>
+  /\b(kode|code|html|css|javascript|js|typescript|ts|source code|contoh kode|tulis kode|buat kode|perbaiki kode)\b/i.test(prompt)
+
+const extractCodeMessage = (value: string, prompt: string): Message | null => {
+  if (!isCodeRequest(prompt)) return null
+
+  const match = value.match(/```(?:html|css|javascript|js|typescript|ts)?\s*([\s\S]*?)```/i)
+  if (!match?.[1]?.trim()) return null
+
+  const code = match[1].trim().replace(/^(html|css|javascript|js|typescript|ts)\s*\n/i, '')
+  return {
+    role: 'assistant',
+    content: '',
+    isCode: true,
+    code,
+    preview: /<html|<!doctype html|<body|<style|<script/i.test(code) ? code : undefined,
+  }
+}
+
 const formatFileSize = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -360,6 +381,7 @@ const formatFileSize = (bytes: number) => {
 const createAttachmentFromFile = async (file: File): Promise<Attachment> => {
   const imageKind = file.type.startsWith('image/')
   const dataUrl = imageKind ? await readFileAsDataUrl(file) : undefined
+  const extractedText = imageKind ? undefined : await readAttachmentText(file)
 
   return {
     name: file.name,
@@ -367,6 +389,7 @@ const createAttachmentFromFile = async (file: File): Promise<Attachment> => {
     type: file.type,
     kind: imageKind ? 'image' : 'file',
     ...(imageKind ? { url: URL.createObjectURL(file), dataUrl } : {}),
+    ...(extractedText ? { extractedText } : {}),
   }
 }
 
@@ -459,16 +482,15 @@ const sendMessage = async () => {
   try {
     await new Promise((resolve) => window.setTimeout(resolve, 450))
 
-    const puterReply = await askPuterAi(finalPrompt, sentAttachments)
-    const generatedCode = generateCodeSnippet(finalPrompt)
+    const previousMessages = conversation.messages.slice(0, -1)
+    const puterReply = await askPuterAi(finalPrompt, sentAttachments, previousMessages)
 
     if (puterReply) {
-      conversation.messages.push({ role: 'assistant', content: String(puterReply) })
-    } else if (generatedCode) {
-      conversation.messages.push(generatedCode)
+      const replyText = String(puterReply)
+      conversation.messages.push(extractCodeMessage(replyText, finalPrompt) ?? { role: 'assistant', content: replyText })
     } else {
       const fallbackText = hasAttachments
-        ? `Saya menerima file berikut: ${attachmentNames.join(', ')}. Jika Anda mau, saya bisa meninjau isinya, meringkasnya, atau membantu mengubahnya menjadi format lain.`
+        ? `File ${attachmentNames.join(', ')} sudah diterima, tetapi NexusAI belum mengembalikan jawaban. Pastikan koneksi Puter AI aktif, lalu coba kirim pertanyaan yang sama lagi.`
         : buildReply(finalPrompt)
       conversation.messages.push({ role: 'assistant', content: fallbackText })
     }
@@ -652,7 +674,7 @@ onBeforeUnmount(() => {
                   <span>Kode siap copy</span>
                   <div class="code-actions">
                     <button class="mini-btn" @click="copyCode(message.code ?? '')">Copy</button>
-                    <button class="mini-btn" @click="previewCode = previewCode === message.preview ? null : message.preview ?? null">
+                    <button v-if="message.preview" class="mini-btn" @click="previewCode = previewCode === message.preview ? null : message.preview ?? null">
                       {{ previewCode === message.preview ? 'Tutup preview' : 'Preview' }}
                     </button>
                   </div>
